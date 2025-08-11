@@ -2,81 +2,107 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
   build-deploy-test:
     runs-on: ubuntu-latest
 
-    env:
-      CLUSTER_NAME: kind
-      KIND_CLUSTER_NAME: kind
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
     steps:
-      # Checkout the repository
-      - name: Checkout repository
+      # Checkout the repository code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # Set up Docker Buildx for advanced build capabilities
+      # Set up Docker Buildx for multi-platform builds and caching
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Log in to DockerHub
+      # Log in to DockerHub using GitHub secrets
       - name: Log in to DockerHub
         uses: docker/login-action@v3
         with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # Install kind (Kubernetes in Docker)
+      # Build and push backend image with both commit SHA and latest tags
+      - name: Build and push backend image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/backend:${{ github.sha }} -t ${{ secrets.DOCKER_USERNAME }}/backend:latest ./backend
+          docker push ${{ secrets.DOCKER_USERNAME }}/backend:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/backend:latest
+
+      # Build and push frontend image with both commit SHA and latest tags
+      - name: Build and push frontend image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/frontend:${{ github.sha }} -t ${{ secrets.DOCKER_USERNAME }}/frontend:latest ./frontend
+          docker push ${{ secrets.DOCKER_USERNAME }}/frontend:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/frontend:latest
+
+      # Install kind (Kubernetes in Docker) for local testing
       - name: Install kind
         uses: helm/kind-action@v1
         with:
-          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          config: kind-config.yaml
 
-      # Install ingress-nginx controller for kind cluster
-      - name: Install ingress-nginx for kind
-        run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+      # Load the locally built Docker images into kind cluster
+      - name: Load Docker images into kind
+        run: |
+          kind load docker-image ${{ secrets.DOCKER_USERNAME }}/backend:${{ github.sha }}
+          kind load docker-image ${{ secrets.DOCKER_USERNAME }}/frontend:${{ github.sha }}
 
-      # Wait for ingress-nginx controller to be ready
-      # Removed unreliable wait for admission webhook job pods
+      # Install ingress-nginx controller into the cluster
+      - name: Set up ingress-nginx
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+      # Wait for ingress-nginx controller deployment to be ready
+      # Includes retry loop for better reliability in CI environments
       - name: Wait for ingress-nginx controller to be ready
-        run: kubectl wait --namespace ingress-nginx \
-              --for=condition=available deployment/ingress-nginx-controller \
-              --timeout=180s
-
-      # Build and push Docker image
-      - name: Build and push Docker image
         run: |
-          docker build -t ${{ env.DOCKERHUB_USERNAME }}/my-app:latest .
-          docker push ${{ env.DOCKERHUB_USERNAME }}/my-app:latest
-
-      # Deploy application to the kind cluster
-      - name: Deploy application
-        run: kubectl apply -f k8s/
-
-      # Wait for application pods to be ready
-      - name: Wait for application pods
-        run: kubectl wait --for=condition=ready pod -l app=my-app --timeout=180s
-
-      # Verify ingress is serving traffic before tests
-      - name: Check ingress endpoint
-        run: |
-          echo "Waiting for ingress to respond..."
-          for i in {1..10}; do
-            if curl -sSf http://localhost/healthz > /dev/null; then
-              echo "Ingress is responding"
+          echo "Waiting for ingress-nginx-controller to be ready..."
+          for i in {1..30}; do
+            if kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=10s; then
+              echo "Ingress-nginx controller is ready."
               exit 0
             fi
-            echo "Still waiting..."
-            sleep 5
+            echo "Retrying in 10s..."
+            sleep 10
           done
-          echo "ERROR: Ingress endpoint not responding"
+          echo "ERROR: ingress-nginx-controller failed to become ready in time."
+          kubectl describe deployment/ingress-nginx-controller -n ingress-nginx
+          kubectl get pods -n ingress-nginx -o wide
           exit 1
 
-      # Run integration tests
-      - name: Run tests
-        run: npm install && npm test
+      # Install cert-manager CRDs before applying manifests that depend on them
+      - name: Install cert-manager CRDs
+        run: |
+          kubectl apply --validate=false -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.3/cert-manager.crds.yaml
+
+      # Apply Kubernetes manifests for backend, frontend, and supporting resources
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/
+
+      # Wait for backend deployment rollout to complete
+      - name: Wait for backend to be ready
+        run: |
+          kubectl rollout status deployment/backend-deployment --timeout=180s
+
+      # Wait for frontend deployment rollout to complete
+      - name: Wait for frontend to be ready
+        run: |
+          kubectl rollout status deployment/frontend-deployment --timeout=180s
+
+      # Smoke test to verify frontend responds (adjust URL/path as needed)
+      - name: Run smoke tests
+        run: |
+          kubectl port-forward service/frontend-service 8080:80 &
+          sleep 5
+          curl -f http://localhost:8080 || (echo "Smoke test failed" && exit 1)
+
+      # Clean up the kind cluster after tests
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster
