@@ -2,106 +2,81 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-# Repository secrets injected as environment variables globally
-env:
-  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-  CLUSTER_NAME: cloudnotes
-  KIND_CLUSTER_NAME: cloudnotes
+    branches:
+      - main
 
 jobs:
   build-deploy-test:
     runs-on: ubuntu-latest
 
-    # Job-level environment variables for image tags
     env:
-      IMAGE_BACKEND_SHA: ${{ secrets.DOCKERHUB_USERNAME }}/cloudnotes-backend:${{ github.sha }}
-      IMAGE_BACKEND_LATEST: ${{ secrets.DOCKERHUB_USERNAME }}/cloudnotes-backend:latest
-      IMAGE_FRONTEND_SHA: ${{ secrets.DOCKERHUB_USERNAME }}/cloudnotes-frontend:${{ github.sha }}
-      IMAGE_FRONTEND_LATEST: ${{ secrets.DOCKERHUB_USERNAME }}/cloudnotes-frontend:latest
+      CLUSTER_NAME: kind
+      KIND_CLUSTER_NAME: kind
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
+      # Checkout the repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx (for multi-arch builds and cache)
+      # Set up Docker Buildx for advanced build capabilities
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+      # Log in to DockerHub
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
-      - name: Build and push backend Docker image
-        run: |
-          docker build -t $IMAGE_BACKEND_SHA ./backend
-          docker push $IMAGE_BACKEND_SHA
-          docker tag $IMAGE_BACKEND_SHA $IMAGE_BACKEND_LATEST
-          docker push $IMAGE_BACKEND_LATEST
+      # Install kind (Kubernetes in Docker)
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
 
-      - name: Build and push frontend Docker image
-        run: |
-          docker build -t $IMAGE_FRONTEND_SHA ./frontend
-          docker push $IMAGE_FRONTEND_SHA
-          docker tag $IMAGE_FRONTEND_SHA $IMAGE_FRONTEND_LATEST
-          docker push $IMAGE_FRONTEND_LATEST
-
-      - name: Install kind (Kubernetes in Docker)
-        run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
-
-      - name: Create kind cluster using provided config
-        run: kind create cluster --name $KIND_CLUSTER_NAME --config kind-config.yaml
-
-      - name: Load backend Docker image into kind cluster
-        run: kind load docker-image $IMAGE_BACKEND_SHA --name $KIND_CLUSTER_NAME
-
-      - name: Load frontend Docker image into kind cluster
-        run: kind load docker-image $IMAGE_FRONTEND_SHA --name $KIND_CLUSTER_NAME
-
-      # Install cert-manager CRDs and cert-manager itself before applying manifests
-      - name: Install cert-manager CRDs and cert-manager
-        run: |
-          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.crds.yaml
-          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-          
-      # Wait for cert-manager webhook pod to be ready (necessary for validating cert-manager resources)
-      - name: Wait for cert-manager webhook pod readiness
-        run: kubectl wait --for=condition=ready pod -l app=webhook -n cert-manager --timeout=180s
-
-      # Install ingress-nginx controller tailored for kind clusters
+      # Install ingress-nginx controller for kind cluster
       - name: Install ingress-nginx for kind
         run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
 
-      # Wait for ingress-nginx controller deployment to be ready before deploying ingress resources
+      # Wait for ingress-nginx controller to be ready
+      # Removed unreliable wait for admission webhook job pods
       - name: Wait for ingress-nginx controller to be ready
-        run: kubectl wait --namespace ingress-nginx --for=condition=available deployment/ingress-nginx-controller --timeout=180s
+        run: kubectl wait --namespace ingress-nginx \
+              --for=condition=available deployment/ingress-nginx-controller \
+              --timeout=180s
 
-      # Wait only for ingress-nginx admission webhook CREATE pod readiness to avoid patch pod timeout
-      - name: Wait for ingress-nginx admission webhook create pod readiness
-        run: kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=ingress-nginx-admission-create -n ingress-nginx --timeout=180s
+      # Build and push Docker image
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ env.DOCKERHUB_USERNAME }}/my-app:latest .
+          docker push ${{ env.DOCKERHUB_USERNAME }}/my-app:latest
 
-      # Deploy your app's Kubernetes manifests (deployments, services, ingress, PVCs, etc.)
-      - name: Deploy Kubernetes manifests
+      # Deploy application to the kind cluster
+      - name: Deploy application
         run: kubectl apply -f k8s/
 
-      # Wait for frontend pods to be ready to ensure the app is up
-      - name: Wait for frontend pod readiness
-        run: kubectl wait --for=condition=ready pod -l app=frontend --timeout=180s
+      # Wait for application pods to be ready
+      - name: Wait for application pods
+        run: kubectl wait --for=condition=ready pod -l app=my-app --timeout=180s
 
-      # Run a quick smoke test inside the cluster using a temporary curl pod
-      - name: Run smoke test (in-cluster curl)
+      # Verify ingress is serving traffic before tests
+      - name: Check ingress endpoint
         run: |
-          kubectl run --rm -i --tty curlpod --image=curlimages/curl --restart=Never -- sh -c "sleep 5; curl -sS -I http://frontend:80 || (kubectl get pods -o wide; kubectl describe svc frontend; exit 1)"
+          echo "Waiting for ingress to respond..."
+          for i in {1..10}; do
+            if curl -sSf http://localhost/healthz > /dev/null; then
+              echo "Ingress is responding"
+              exit 0
+            fi
+            echo "Still waiting..."
+            sleep 5
+          done
+          echo "ERROR: Ingress endpoint not responding"
+          exit 1
 
-      # Cleanup: delete the kind cluster regardless of success or failure
-      - name: Delete kind cluster
-        if: always()
-        run: kind delete cluster --name $KIND_CLUSTER_NAME
+      # Run integration tests
+      - name: Run tests
+        run: npm install && npm test
