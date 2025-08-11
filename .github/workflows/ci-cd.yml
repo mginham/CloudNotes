@@ -10,6 +10,7 @@ env:
   DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
   DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
   CLUSTER_NAME: cloudnotes
+  KIND_CLUSTER_NAME: cloudnotes
 
 jobs:
   build-deploy-test:
@@ -20,7 +21,6 @@ jobs:
       IMAGE_BACKEND_LATEST: ${{ secrets.DOCKERHUB_USERNAME }}/cloudnotes-backend:latest
       IMAGE_FRONTEND_SHA: ${{ secrets.DOCKERHUB_USERNAME }}/cloudnotes-frontend:${{ github.sha }}
       IMAGE_FRONTEND_LATEST: ${{ secrets.DOCKERHUB_USERNAME }}/cloudnotes-frontend:latest
-      KIND_CLUSTER_NAME: ${{ env.CLUSTER_NAME }}
 
     steps:
       - name: Checkout repository
