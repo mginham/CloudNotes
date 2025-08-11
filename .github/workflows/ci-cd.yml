@@ -80,9 +80,13 @@ jobs:
       - name: Install ingress-nginx for kind
         run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
 
-      # Wait for ingress-nginx controller to be fully ready before deploying ingress resources
-      - name: Wait for ingress-nginx admission webhook readiness
-        run: kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=admission-webhook -n ingress-nginx --timeout=180s
+      # Wait for ingress-nginx controller deployment to be ready before deploying ingress resources
+      - name: Wait for ingress-nginx controller to be ready
+        run: kubectl wait --namespace ingress-nginx --for=condition=available deployment/ingress-nginx-controller --timeout=180s
+
+      # Wait only for ingress-nginx admission webhook CREATE pod readiness to avoid patch pod timeout
+      - name: Wait for ingress-nginx admission webhook create pod readiness
+        run: kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=ingress-nginx-admission-create -n ingress-nginx --timeout=180s
 
       # Deploy your app's Kubernetes manifests (deployments, services, ingress, PVCs, etc.)
       - name: Deploy Kubernetes manifests
