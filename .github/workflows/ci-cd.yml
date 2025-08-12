@@ -10,6 +10,9 @@ jobs:
   build-deploy-test:
     runs-on: ubuntu-latest
 
+    env:
+      KIND_CLUSTER_NAME: kind
+
     steps:
       # Checkout the repository code
       - name: Checkout code
@@ -49,8 +52,8 @@ jobs:
       # Load the locally built Docker images into kind cluster
       - name: Load Docker images into kind
         run: |
-          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ github.sha }}
-          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ github.sha }}
+          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ github.sha }} --name $KIND_CLUSTER_NAME
+          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ github.sha }} --name $KIND_CLUSTER_NAME
 
       # Install ingress-nginx controller into the cluster
       - name: Set up ingress-nginx
@@ -105,4 +108,4 @@ jobs:
       # Clean up the kind cluster after tests
       - name: Delete kind cluster
         if: always()
-        run: kind delete cluster
+        run: kind delete cluster --name $KIND_CLUSTER_NAME
